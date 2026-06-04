@@ -2,6 +2,7 @@ import * as CFI from './epubcfi.js'
 import { TOCProgress, SectionProgress } from './progress.js'
 import { Overlayer } from './overlayer.js'
 import { textWalker } from './text-walker.js'
+import { TextFragmentResolver } from './fragment-directives.js'
 
 const SEARCH_PREFIX = 'foliate-search:'
 
@@ -216,6 +217,7 @@ export class View extends HTMLElement {
     #tocProgress
     #pageProgress
     #searchResults = new Map()
+    #textFragmentResolver = new TextFragmentResolver()
     #cursorAutohider = new CursorAutohider(this, () =>
         this.hasAttribute('autohide-cursor'))
     isFixedLayout = false
@@ -544,6 +546,7 @@ export class View extends HTMLElement {
         this.history.clear()
         this.tts = null
         this.mediaOverlay = null
+        this.#textFragmentResolver.reset()
     }
     goToTextStart() {
         return this.goTo(this.book.landmarks
@@ -689,7 +692,17 @@ export class View extends HTMLElement {
                 const [index, anchor] = this.#sectionProgress.getSection(target.fraction)
                 return { index, anchor }
             }
-            if (CFI.isCFI.test(target)) return this.resolveCFI(target)
+            if (CFI.isCFI.test(target)) return this.resolveCFI(target);
+
+            const locator = this.#textFragmentResolver.getTextFragmentLocator(target)
+            if (locator) {
+                const { index } = this.book.resolveHref(target)
+                return {
+                    index,
+                    anchor: doc => this.#textFragmentResolver
+                        .resolveTextFragmentRange(doc, index, locator)
+                }
+            }
             return this.book.resolveHref(target)
         } catch (e) {
             console.error(e)
@@ -833,6 +846,32 @@ export class View extends HTMLElement {
         const { index } = this.renderer.getContents()[0]
         return this.mediaOverlay.start(index)
     }
+
+
+  // MARK: - Text Fragment Locator methods
+  registerTextFragmentLocators(index, jsonString) {
+    const contents = this.renderer?.getContents?.() ?? []
+    const content = contents.find(x => x.index === index)
+    this.#textFragmentResolver.registerTextFragmentLocators(
+      content?.doc,
+      index,
+      jsonString
+    )
+  }
+  isTextFragmentLocator(fragment) {
+    return this.#textFragmentResolver.isTextFragmentLocator(fragment)
+  }
+  hasTextFragmentLocators(index) {
+    return this.#textFragmentResolver.hasTextFragmentLocators(index)
+  }
+  findFirstCachedLocatorContainingRange(doc, index, range) {
+    return this.#textFragmentResolver
+    .findFirstCachedLocatorContainingRange(doc, index, range)
+  }
+  resolveTextFragmentRange(doc, index, fragment) {
+    return this.#textFragmentResolver
+    .resolveTextFragmentRange(doc, index, fragment)
+  }
 }
 
 customElements.define('foliate-view', View)
