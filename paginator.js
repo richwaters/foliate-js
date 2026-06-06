@@ -894,7 +894,9 @@ export class Paginator extends HTMLElement {
     }
     async #scrollToRect(rect, reason) {
         if (this.scrolled) {
-            const offset = this.#getRectMapper()(rect).left - this.#margin
+            const mapped = this.#getRectMapper()(rect)
+            const rectCenter = (mapped.left + mapped.right) / 2
+            const offset = rectCenter - (this.size / 2)
             return this.#scrollTo(offset, reason)
         }
         const offset = this.#getRectMapper()(rect).left
@@ -935,10 +937,18 @@ export class Paginator extends HTMLElement {
         const rects = uncollapse(anchor)?.getClientRects?.()
         // if anchor is an element or a range
         if (rects) {
+            const rectList = Array.from(rects)
+                .filter(r => r.width > 0 && r.height > 0)
+            if (this.scrolled && rectList.length) {
+                const mappedRects = rectList.map(r => this.#getRectMapper()(r))
+                const start = Math.min(...mappedRects.map(r => r.left))
+                const end = Math.max(...mappedRects.map(r => r.right))
+                await this.#scrollTo(((start + end) / 2) - (this.size / 2), reason)
+                return
+            }
             // when the start of the range is immediately after a hyphen in the
             // previous column, there is an extra zero width rect in that column
-            const rect = Array.from(rects)
-                .find(r => r.width > 0 && r.height > 0) || rects[0]
+            const rect = rectList[0] || rects[0]
             if (!rect) return
             await this.#scrollToRect(rect, reason)
             return
