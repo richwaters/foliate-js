@@ -696,11 +696,14 @@ export class View extends HTMLElement {
 
             const locator = this.#textFragmentResolver.getTextFragmentLocator(target)
             if (locator) {
-                const { index } = this.book.resolveHref(target)
-                return {
-                    index,
-                    anchor: doc => this.#textFragmentResolver
-                        .resolveTextFragmentRange(doc, index, locator)
+                const resolved = this.book.resolveHref(target)
+                if (resolved) {
+                    const { index } = resolved
+                    return {
+                        index,
+                        anchor: doc => this.#textFragmentResolver
+                            .resolveTextFragmentRange(doc, index, locator)
+                    }
                 }
             }
             return this.book.resolveHref(target)
