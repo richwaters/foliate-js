@@ -2,6 +2,7 @@ import * as CFI from './epubcfi.js'
 import { TOCProgress, SectionProgress } from './progress.js'
 import { Overlayer } from './overlayer.js'
 import { textWalker } from './text-walker.js'
+import { TextFragmentResolver } from './fragment-directives.js'
 
 const SEARCH_PREFIX = 'foliate-search:'
 
@@ -216,7 +217,7 @@ export class View extends HTMLElement {
     #tocProgress
     #pageProgress
     #searchResults = new Map()
-    #searchDraw
+    #textFragmentResolver = new TextFragmentResolver()
     #searchDrawOptions
     #cursorAutohider = new CursorAutohider(this, () =>
         this.hasAttribute('autohide-cursor'))
@@ -451,6 +452,19 @@ export class View extends HTMLElement {
                 return { index, anchor }
             }
             if (CFI.isCFI.test(target)) return this.resolveCFI(target)
+
+            const locator = this.#textFragmentResolver.getTextFragmentLocator(target)
+            if (locator) {
+                const resolved = this.book.resolveHref(target)
+                if (resolved) {
+                    const { index } = resolved
+                    return {
+                        index,
+                        anchor: doc => this.#textFragmentResolver
+                            .resolveTextFragmentRange(doc, index, locator)
+                    }
+                }
+            }
             return this.book.resolveHref(target)
         } catch (e) {
             console.error(e)
