@@ -217,6 +217,7 @@ export class View extends HTMLElement {
     #tocProgress
     #pageProgress
     #searchResults = new Map()
+    #searchDraw
     #textFragmentResolver = new TextFragmentResolver()
     #searchDrawOptions
     #cursorAutohider = new CursorAutohider(this, () =>
