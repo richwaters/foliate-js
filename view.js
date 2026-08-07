@@ -2,6 +2,7 @@ import * as CFI from './epubcfi.js'
 import { TOCProgress, SectionProgress } from './progress.js'
 import { Overlayer } from './overlayer.js'
 import { textWalker } from './text-walker.js'
+import { TextFragmentResolver } from './fragment-directives.js'
 
 const SEARCH_PREFIX = 'foliate-search:'
 
@@ -216,6 +217,8 @@ export class View extends HTMLElement {
     #tocProgress
     #pageProgress
     #searchResults = new Map()
+    #textFragmentResolver = new TextFragmentResolver()
+    #searchDrawOptions
     #cursorAutohider = new CursorAutohider(this, () =>
         this.hasAttribute('autohide-cursor'))
     isFixedLayout = false
@@ -596,8 +599,8 @@ export class View extends HTMLElement {
             const href_ = a.getAttribute('href')
             const href = section?.resolveHref?.(href_) ?? href_
             if (book?.isExternal?.(href))
-                Promise.resolve(this.#emit('external-link', { a, href }, true))
-                    .then(x => x ? globalThis.open(href, '_blank') : null)
+                Promise.resolve(this.#emit('external-link', { a, href_ }, true))
+                    .then(x => x ? globalThis.open(href_, '_blank') : null)
                     .catch(e => console.error(e))
             else Promise.resolve(this.#emit('link', { a, href }, true))
                 .then(x => x ? this.goTo(href) : null)
@@ -617,7 +620,7 @@ export class View extends HTMLElement {
                     return
                 }
                 const range = doc ? anchor(doc) : anchor
-                overlayer.add(value, range, Overlayer.outline)
+                overlayer.add(value, range, this.#searchDraw, this.#searchDrawOptions)
             }
             return
         }
@@ -690,6 +693,19 @@ export class View extends HTMLElement {
                 return { index, anchor }
             }
             if (CFI.isCFI.test(target)) return this.resolveCFI(target)
+
+            const locator = this.#textFragmentResolver.getTextFragmentLocator(target)
+            if (locator) {
+                const resolved = this.book.resolveHref(target)
+                if (resolved) {
+                    const { index } = resolved
+                    return {
+                        index,
+                        anchor: doc => this.#textFragmentResolver
+                            .resolveTextFragmentRange(doc, index, locator)
+                    }
+                }
+            }
             return this.book.resolveHref(target)
         } catch (e) {
             console.error(e)
@@ -784,6 +800,8 @@ export class View extends HTMLElement {
     }
     async * search(opts) {
         this.clearSearch()
+        this.#searchDraw = opts.draw ?? Overlayer.outline
+        this.#searchDrawOptions = opts.drawOptions
         const { searchMatcher } = await import('./search.js')
         const { query, index } = opts
         const matcher = searchMatcher(textWalker,
