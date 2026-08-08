@@ -852,6 +852,32 @@ export class View extends HTMLElement {
         const { index } = this.renderer.getContents()[0]
         return this.mediaOverlay.start(index)
     }
+
+
+  // MARK: - Text Fragment Locator methods
+  registerTextFragmentLocators(index, jsonString) {
+    const contents = this.renderer?.getContents?.() ?? []
+    const content = contents.find(x => x.index === index)
+    this.#textFragmentResolver.registerTextFragmentLocators(
+      content?.doc,
+      index,
+      jsonString
+    )
+  }
+  isTextFragmentLocator(fragment) {
+    return this.#textFragmentResolver.isTextFragmentLocator(fragment)
+  }
+  hasTextFragmentLocators(index) {
+    return this.#textFragmentResolver.hasTextFragmentLocators(index)
+  }
+  findFirstCachedLocatorContainingRange(doc, index, range) {
+    return this.#textFragmentResolver
+    .findFirstCachedLocatorContainingRange(doc, index, range)
+  }
+  resolveTextFragmentRange(doc, index, fragment) {
+    return this.#textFragmentResolver
+    .resolveTextFragmentRange(doc, index, fragment)
+  }
 }
 
 customElements.define('foliate-view', View)
