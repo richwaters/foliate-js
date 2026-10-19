@@ -218,7 +218,7 @@ export class View extends HTMLElement {
     #pageProgress
     #searchResults = new Map()
     #searchDraw
-    #textFragmentResolver = new TextFragmentResolver()
+    textFragmentResolver = new TextFragmentResolver()
     #searchDrawOptions
     #cursorAutohider = new CursorAutohider(this, () =>
         this.hasAttribute('autohide-cursor'))
@@ -695,14 +695,14 @@ export class View extends HTMLElement {
             }
             if (CFI.isCFI.test(target)) return this.resolveCFI(target)
 
-            const locator = this.#textFragmentResolver.getTextFragmentLocator(target)
+            const locator = this.textFragmentResolver.getTextFragmentLocator(target)
             if (locator) {
                 const resolved = this.book.resolveHref(target)
                 if (resolved) {
                     const { index } = resolved
                     return {
                         index,
-                        anchor: doc => this.#textFragmentResolver
+                        anchor: doc => this.textFragmentResolver
                             .resolveTextFragmentRange(doc, index, locator)
                     }
                 }
@@ -858,24 +858,24 @@ export class View extends HTMLElement {
   registerTextFragmentLocators(index, jsonString) {
     const contents = this.renderer?.getContents?.() ?? []
     const content = contents.find(x => x.index === index)
-    this.#textFragmentResolver.registerTextFragmentLocators(
+    this.textFragmentResolver.registerTextFragmentLocators(
       content?.doc,
       index,
       jsonString
     )
   }
   isTextFragmentLocator(fragment) {
-    return this.#textFragmentResolver.isTextFragmentLocator(fragment)
+    return this.textFragmentResolver.isTextFragmentLocator(fragment)
   }
   hasTextFragmentLocators(index) {
-    return this.#textFragmentResolver.hasTextFragmentLocators(index)
+    return this.textFragmentResolver.hasTextFragmentLocators(index)
   }
   findFirstCachedLocatorContainingRange(doc, index, range) {
-    return this.#textFragmentResolver
+    return this.textFragmentResolver
     .findFirstCachedLocatorContainingRange(doc, index, range)
   }
   resolveTextFragmentRange(doc, index, fragment) {
-    return this.#textFragmentResolver
+    return this.textFragmentResolver
     .resolveTextFragmentRange(doc, index, fragment)
   }
 }

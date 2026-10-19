@@ -1,5 +1,6 @@
 
 const WS_RE = /[\s\u00A0]+/gu;
+const INVISIBLE_TAGS = new Set(['img', 'svg', 'video', 'audio', 'object', 'embed', 'iframe', 'canvas', 'input', 'math']);
 const BLOCK_TAGS = new Set([
   'address', 'article', 'aside', 'blockquote', 'caption', 'colgroup',
   'dd', 'details', 'dialog', 'div', 'dl', 'dt',
@@ -9,6 +10,8 @@ const BLOCK_TAGS = new Set([
   'search', 'section', 'summary',
   'table', 'tbody', 'td', 'tfoot', 'th', 'thead', 'tr', 'ul', 'br'
 ]);
+const BLOCK_DISPLAY_STYLES = new Set(['block', 'table', 'flow-root', 'grid', 'flex', 'list-item']);
+
 
 
 
@@ -19,9 +22,20 @@ export class TextFragmentResolver {
   #sectionBuildState = new Map();
   #sectionBuildDoc = new Map();
   #normalizedTextMapByDoc = new WeakMap();
+
   //#docObservers = new WeakMap();
 
   #rangeCacheBuildStarted = 0
+
+  #options;
+
+  constructor(options = {}) {
+    this.#options = Object.freeze({
+      allowCrossBlockTerms: false,
+      staticBlockTags: false,
+      ...options,
+    });
+  }
 
   static buildBatchTimeChunk = 10;
   static buildDelayMs = 8;
@@ -163,23 +177,32 @@ export class TextFragmentResolver {
     return parsed;
   }
 
-  shouldSkipTextNode(node, doc) {
+  shouldSkipTextNode(node, doc, skipCache) {
     const parent = node.parentElement;
     if (!parent) return false;
+    const cached = skipCache?.get(parent);
+    if (cached !== undefined) return cached;
 
     const tag = parent.tagName?.toLowerCase();
-    if (tag === "script" || tag === "style") return true;
-    if (parent.closest("head")) return true;
-
-    const style = doc.defaultView?.getComputedStyle(parent);
-    if (style?.display === "none") return true;
-    if (style?.visibility === "hidden") return true;
-
-    return false;
+    let result = false;
+    if (tag === "script" || tag === "style" || parent.closest("head")) {
+      result = true;
+    } else {
+      const style = doc.defaultView?.getComputedStyle(parent);
+      result = style?.display === "none" || style?.visibility === "hidden";
+    }
+    skipCache?.set(parent, result);
+    return result;
   }
 
   isBlockElement(el) {
-    return el && BLOCK_TAGS.has(el.tagName?.toLowerCase());
+    if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
+    if (el.tagName?.toLowerCase() === 'br') return true;
+    if (this.#options.staticBlockTags) return BLOCK_TAGS.has(el.tagName?.toLowerCase());
+
+    const display = el.ownerDocument.defaultView?.getComputedStyle(el)?.display;
+    const result = !display ? BLOCK_TAGS.has(el.tagName?.toLowerCase()) : BLOCK_DISPLAY_STYLES.has(display) || display.split(' ').includes('list-item');
+    return result;
   }
 
 
@@ -223,25 +246,36 @@ export class TextFragmentResolver {
 
   buildNormalizedTextMap(doc) {
     const root = doc.documentElement;
-    const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    //const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT);
 
     const entries = [];
     let normalized = "";
     let pendingSpace = false;
 
-    let prevNode = null;
-
+    let pendingBreak = false;
+    const openBlocks = [];
+    const blockBoundaries = new Set();
+    const skipCache = new Map();
+ 
     for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      // Blocks we have left since the previous node; capped at one separator.
+      while (openBlocks.length && !openBlocks[openBlocks.length - 1].contains(node)) {
+        openBlocks.pop();
+        if (normalized.length > 0) pendingBreak = true;
+      }
+
+      if (node.nodeType === Node.ELEMENT_NODE) {
+        const tag = node.tagName?.toLowerCase();
+        if (!INVISIBLE_TAGS.has(tag) && this.isBlockElement(node)) {
+          openBlocks.push(node);
+        }
+        continue;
+      }
+
       const raw = node.nodeValue ?? "";
       if (!raw) continue;
-      if (this.shouldSkipTextNode(node, doc)) continue;
-
-      if (prevNode && normalized.length > 0 && !normalized.endsWith(" ")) {
-         if (this.hasBlockBoundaryBetween(prevNode, node)) {
-           pendingSpace = true;
-         }
-       }
-      prevNode = node;
+      if (this.shouldSkipTextNode(node, doc, skipCache)) continue;
 
       for (let rawIndex = 0; rawIndex < raw.length; rawIndex++) {
         const ch = raw[rawIndex];
@@ -253,14 +287,18 @@ export class TextFragmentResolver {
           continue;
         }
 
-        if (pendingSpace && normalized.length > 0) {
+        if ((pendingBreak || pendingSpace) && normalized.length > 0) {
           normalized += " ";
         }
-        pendingSpace = false;
 
+       const wasBreak = pendingBreak;
 
-        const normStart = normalized.length;
-        normalized += this.#caseFold( ch )
+       pendingBreak = false;
+       pendingSpace = false;
+
+       const normStart = normalized.length;
+       if (wasBreak && normStart > 0) blockBoundaries.add(normStart);
+       normalized += this.#caseFold( ch )
 
         entries.push({
           normStart,
@@ -288,7 +326,7 @@ export class TextFragmentResolver {
     });
      */
 
-    return { normalized, entries, wordBoundaries };
+    return { normalized, entries, wordBoundaries, blockBoundaries };
   }
 
   #getNormalizedTextMap(doc) {
@@ -340,7 +378,15 @@ export class TextFragmentResolver {
     return indices;
   }
 
-  findFirstMatch(docNorm, wordBoundaries, selector) {
+  #shouldRejectCrossBlockTerm(blockBoundaries, from, to) {
+    if (this.#options.allowCrossBlockTerms) return false;
+    for (let b = from + 1; b < to; b++) {
+      if (blockBoundaries.has(b)) return true;
+    }
+    return false;
+  }
+
+  findFirstMatch(docNorm, blockBoundaries, wordBoundaries, selector) {
     const hasEnd = selector.end != null;
     const hasSuffix = selector.suffix != null;
     const start = this.#collapseAndTrimEdges(selector.start, true, !(hasEnd || hasSuffix));
@@ -374,6 +420,11 @@ export class TextFragmentResolver {
           continue;
         }
 
+        if (this.#shouldRejectCrossBlockTerm(blockBoundaries, i, startEnd)) {
+          pos = i + 1;
+          continue;
+        }
+
         let j = docNorm.indexOf(end, startEnd);
 
         while (j >= 0) {
@@ -389,12 +440,15 @@ export class TextFragmentResolver {
             j = docNorm.indexOf(end, j + 1);
             continue;
           }
-
-          if (prefix && !this.#prefixMatches(docNorm, wordBoundaries, i, prefix)) {
-              break;
+          if (this.#shouldRejectCrossBlockTerm(blockBoundaries, j, matchEnd)) {
+            j = docNorm.indexOf(end, j + 1);
+            continue;
           }
 
-          if (suffix && !this.#suffixMatches(docNorm, wordBoundaries, matchEnd, suffix)) {
+          if (prefix && !this.#prefixMatches(docNorm, wordBoundaries, blockBoundaries, i, prefix)) {
+            break;
+          }
+          if (suffix && !this.#suffixMatches(docNorm, wordBoundaries, blockBoundaries, matchEnd, suffix)) {
             j = docNorm.indexOf(end, j + 1);
             continue
           }
@@ -424,12 +478,17 @@ export class TextFragmentResolver {
         continue;
       }
 
-      if (prefix && !this.#prefixMatches(docNorm, wordBoundaries, i, prefix)) {
+      if (this.#shouldRejectCrossBlockTerm(blockBoundaries, i, matchEnd)) {
         pos = i + 1;
         continue;
       }
 
-      if (suffix && !this.#suffixMatches(docNorm, wordBoundaries, matchEnd, suffix)) {
+      if (prefix && !this.#prefixMatches(docNorm, wordBoundaries, blockBoundaries, i, prefix)) {
+        pos = i + 1;
+        continue;
+      }
+
+      if (suffix && !this.#suffixMatches(docNorm, wordBoundaries, blockBoundaries, matchEnd, suffix)) {
         pos = i + 1;
         continue
       }
@@ -508,8 +567,8 @@ export class TextFragmentResolver {
       return null;
     }
 
-    const { normalized, entries, wordBoundaries } = this.#getNormalizedTextMap(doc)
-    const match = this.findFirstMatch(normalized, wordBoundaries, selector);
+    const { normalized, entries, wordBoundaries, blockBoundaries } = this.#getNormalizedTextMap(doc)    
+    const match = this.findFirstMatch(normalized, blockBoundaries, wordBoundaries, selector);
     if (!match) {
       console.warn( `[TF] No match found for text fragment locator: ${locator}`);
       return null;
@@ -522,7 +581,7 @@ export class TextFragmentResolver {
     return range;
   }
 
-  #prefixMatches(docNorm, wordBoundaries, pos, prefix) {
+  #prefixMatches(docNorm, wordBoundaries, blockBoundaries, pos, prefix) {
     const before = docNorm.slice(0, pos);
     const trimmedPrefix = prefix.trimEnd();
 
@@ -540,11 +599,14 @@ export class TextFragmentResolver {
     if (!wordBoundaries.has(preStart)) {
       return false;
     }
+    if (this.#shouldRejectCrossBlockTerm(blockBoundaries, preStart, beforeTrimmed.length)) {
+      return false;
+    }
 
     return true;
   }
 
-  #suffixMatches(docNorm, wordBoundaries, pos, suffix) {
+  #suffixMatches(docNorm, wordBoundaries, blockBoundaries, pos, suffix) {
     const after = docNorm.slice(pos);
     const trimmedSuffix = suffix.trimStart();
 
@@ -558,8 +620,13 @@ export class TextFragmentResolver {
     }
 
     const afterTrimmed = after.trimStart();
-    const sufEndAbs = pos + (after.length - afterTrimmed.length) + trimmedSuffix.length;
-    if (!wordBoundaries.has(sufEndAbs)) {
+    const suffixStart = pos + (after.length - afterTrimmed.length);
+    const suffixEnd = suffixStart + trimmedSuffix.length;
+    if (!wordBoundaries.has(suffixEnd)) {
+      return false;
+    }
+
+    if (this.#shouldRejectCrossBlockTerm(blockBoundaries, suffixStart, suffixEnd)) {
       return false;
     }
 
@@ -647,24 +714,31 @@ export class TextFragmentResolver {
     let index = state.nextIndex
     let built = 0
 
-    while (index < locators.length && performance.now() < deadline) {
-      const locator = locators[index];
-      const entry = cache.get(locator);
-      if (entry?.doc === doc && entry.range) {
-        index += 1
-        continue;
-      }
-      //this.resolveTextFragmentRange( doc, sectionIndex, locator )
-      const range = this.resolveTextFragmentRange(doc, sectionIndex, locator);
-      if (range) {
-        if (state.prevRange &&
-            range.compareBoundaryPoints(Range.START_TO_START, state.prevRange) < 0) {
-          console.warn(`[TF] Out-of-order locator at index ${index}: ${locator}`);
+    try {
+      while (index < locators.length && performance.now() < deadline) {
+        const locator = locators[index];
+        const entry = cache.get(locator);
+        if (entry?.doc === doc && entry.range) {
+          index += 1
+          continue;
         }
-        state.prevRange = range;
+        //this.resolveTextFragmentRange( doc, sectionIndex, locator )
+        const range = this.resolveTextFragmentRange(doc, sectionIndex, locator);
+        if (range) {
+          if (state.prevRange &&
+              range.compareBoundaryPoints(Range.START_TO_START, state.prevRange) < 0) {
+            console.warn(`[TF] Out-of-order locator at index ${index}: ${locator}`);
+          }
+          state.prevRange = range;
+        }
+        built += 1
+        index += 1
       }
-      built += 1
-      index += 1
+    } catch (error) {
+      console.error(`[TF] Range cache build aborted for section ${sectionIndex} at index ${index}: ${locators[index]}`, error);
+      this.#sectionBuildState.delete(sectionIndex);
+      this.#sectionBuildTimers.delete(sectionIndex);
+      return;
     }
 
     state.nextIndex = index;
@@ -682,7 +756,6 @@ export class TextFragmentResolver {
     }, TextFragmentResolver.buildDelayMs);
     this.#sectionBuildTimers.set(sectionIndex, timer);
   }
-
 
   hasTextFragmentLocators(sectionIndex) {
     const locators = this.#sectionLocators.get(sectionIndex);
