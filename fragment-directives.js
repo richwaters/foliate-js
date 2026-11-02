@@ -1,5 +1,5 @@
-
 const WS_RE = /[\s\u00A0]+/gu;
+
 const INVISIBLE_TAGS = new Set(['img', 'svg', 'video', 'audio', 'object', 'embed', 'iframe', 'canvas', 'input', 'math']);
 const BLOCK_TAGS = new Set([
   'address', 'article', 'aside', 'blockquote', 'caption', 'colgroup',
