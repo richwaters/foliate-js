@@ -1,5 +1,5 @@
-const WS_RE = /[\s\u00A0]+/gu;
 
+const WS_RE = /[\s\u00A0]+/gu;
 const INVISIBLE_TAGS = new Set(['img', 'svg', 'video', 'audio', 'object', 'embed', 'iframe', 'canvas', 'input', 'math']);
 const BLOCK_TAGS = new Set([
   'address', 'article', 'aside', 'blockquote', 'caption', 'colgroup',
@@ -10,10 +10,55 @@ const BLOCK_TAGS = new Set([
   'search', 'section', 'summary',
   'table', 'tbody', 'td', 'tfoot', 'th', 'thead', 'tr', 'ul', 'br'
 ]);
-const BLOCK_DISPLAY_STYLES = new Set(['block', 'table', 'flow-root', 'grid', 'flex', 'list-item']);
+const BLOCK_DISPLAY_STYLES = new Set(['block', 'table', 'table-cell', 'flow-root', 'grid', 'flex', 'list-item']);
+const DOUBLE_QUOTES_RE = /[\u00AB\u00BB\u05F4\u201C-\u201F\u2E42\u301D-\u301F\uFF02]/g;
+const SINGLE_QUOTES_RE = /[\u05F3\u2018-\u201B\u2039\u203A\u300C-\u300F\uFE41-\uFE44\uFF07\uFF62\uFF63]/g;
+const BASE_COLLATOR = new Intl.Collator('und', { sensitivity: 'base' });
+const FOLDED_CHARS = new Map();
+const LOG_LEVELS = { silent: 0, error: 1, warn: 2, info: 3, debug: 4 };
 
 
+// Folds one UTF-16 code unit for matching. Upper then lower case, with the
+// marks removed, is close to Unicode case folding plus accent removal: ς, ſ
+// and µ become σ, s and μ, ß becomes ss, and é becomes e. But it also turns
+// dotless ı into i and drops Thai vowel signs, which the browsers' primary-
+// strength matching keeps. So the fold is used only if a base-sensitivity
+// collator, which compares the same way, finds it equal to the original.
+function foldChar(ch) {
+  let folded = FOLDED_CHARS.get(ch);
+  if (folded !== undefined) return folded;
+  folded = ch.toUpperCase().toLowerCase().normalize('NFD').replace(/\p{M}/gu, '');
+  if (BASE_COLLATOR.compare(ch, folded) !== 0) folded = ch.toLowerCase();
+  FOLDED_CHARS.set(ch, folded);
+  return folded;
+}
 
+// Descendants of root in shadow-including tree order: each node, then its open
+// shadow tree, then its children.
+function* shadowIncludingDescendants(root) {
+  const stack = [];
+  const pushChildren = node => {
+    for (let child = node.lastChild; child; child = child.previousSibling) stack.push(child);
+    const shadow = node.shadowRoot;
+    if (shadow) {
+      for (let child = shadow.lastChild; child; child = child.previousSibling) stack.push(child);
+    }
+  };
+  pushChildren(root);
+  while (stack.length) {
+    const node = stack.pop();
+    yield node;
+    pushChildren(node);
+  }
+}
+
+// Node.contains doesn't cross shadow boundaries.
+function shadowIncludingContains(ancestor, node) {
+  for (let n = node; n; n = n.parentNode ?? n.host) {
+    if (n === ancestor) return true;
+  }
+  return false;
+}
 
 export class TextFragmentResolver {
   #sectionLocators = new Map();
@@ -33,17 +78,27 @@ export class TextFragmentResolver {
     this.#options = Object.freeze({
       allowCrossBlockTerms: false,
       staticBlockTags: false,
-      ...options,
+      log: "warn",
+  ...options,
     });
   }
 
   static buildBatchTimeChunk = 10;
   static buildDelayMs = 8;
 
+  #log(level, ...args) {
+    const threshold = LOG_LEVELS[this.#options.log] ?? LOG_LEVELS.warn;
+    if (LOG_LEVELS[level] > threshold) return;
+    const method = level === "error" || level === "warn" ? level : "log";
+    console[method]("[TF]", ...args);
+  }
+
   decodeComponent(value) {
     if (value == null) return "";
     try {
-      return decodeURIComponent(value.replace(/\+/g, " "));
+      // A "%" not followed by two hex digits is a literal "%", as in the URL
+      // spec's percent-decode, rather than an error for the whole term.
+      return decodeURIComponent(value.replace(/%(?![0-9A-Fa-f]{2})/g, '%25'));
     } catch {
       return value;
     }
@@ -61,11 +116,15 @@ export class TextFragmentResolver {
   }
 
   #caseFold(s) {
-      return s.toLowerCase().normalize('NFD').replace(/\p{M}/gu, '');
-  }
-
-  isWordChar(ch) {
-    return /[\p{L}\p{N}]/u.test(ch);
+    // Fold a character at a time, the same as the document, so that context
+    // rules like a final ς apply to neither.
+    let folded = "";
+    for (let i = 0; i < s.length; i++) {
+      folded += foldChar(s[i]);
+    }
+    return folded
+        .replace(DOUBLE_QUOTES_RE, '"')
+        .replace(SINGLE_QUOTES_RE, "'")
   }
 
   isTextFragmentLocator(value) {
@@ -99,7 +158,7 @@ export class TextFragmentResolver {
     }
 
     if (!fragment.startsWith("text=") && !fragment.includes("&text=")) {
-      console.warn("[TF]", "splitTextDirectives no text= found", fragment);
+      this.#log("info", "splitTextDirectives no text= found", fragment);
       return [];
     }
 
@@ -116,12 +175,12 @@ export class TextFragmentResolver {
     try {
       locators = JSON.parse(jsonString);
     } catch (error) {
-      console.error("[TF] Failed to parse section locators JSON:", error);
+      this.#log("error", "Failed to parse section locators JSON:", error);
       return;
     }
 
     if (!Array.isArray(locators)) {
-      console.warn("[TF] registerTextFragmentLocators expected array");
+      this.#log("warn","registerTextFragmentLocators expected array") ;
       return;
     }
 
@@ -132,49 +191,46 @@ export class TextFragmentResolver {
     if (doc) {
       this.ensureSectionCacheBuilding(doc, sectionIndex);
     }
-    console.log(`[TF] Registered ${locators.length} locators for section ${sectionIndex}`);
+    this.#log("info",`Registered ${locators.length} locators for section ${sectionIndex}`);
   }
 
   parseTextSelector(raw) {
     let s = raw;
+    const tokens = raw.split(",");
+    if (tokens.length > 4) return this.#badSelector(raw);
 
-    let suffixRaw = null;
-    const suffixIndex = s.lastIndexOf(",-");
-    if (suffixIndex >= 0) {
-      suffixRaw = s.slice(suffixIndex + 2);
-      s = s.slice(0, suffixIndex);
+    let prefix = null;
+    if (tokens[0].endsWith("-")) {
+      prefix = tokens.shift().slice(0, -1);
+      if (!prefix || prefix.includes("-") || !tokens.length) return this.#badSelector(raw);
     }
 
-    let prefixRaw = null;
-    const prefixIndex = s.indexOf("-,");
-    if (prefixIndex >= 0) {
-      prefixRaw = s.slice(0, prefixIndex);
-      s = s.slice(prefixIndex + 2);
+    let suffix = null;
+    if (tokens[tokens.length - 1].startsWith("-")) {
+      suffix = tokens.pop().slice(1);
+      if (!suffix || suffix.includes("-") || !tokens.length) return this.#badSelector(raw);
     }
 
-    let startRaw = s;
-    let endRaw = null;
-    const commaIndex = s.indexOf(",");
-    if (commaIndex >= 0) {
-      startRaw = s.slice(0, commaIndex);
-      endRaw = s.slice(commaIndex + 1);
-    }
+    if (tokens.length > 2) return this.#badSelector(raw);
+    const [start, end = null] = tokens;
+    if (!start || start.includes("-")) return this.#badSelector(raw);
+    if (end !== null && (!end || end.includes("-"))) return this.#badSelector(raw);
 
-    const start = this.decodeComponent(startRaw);
-    if (!start) {
-      console.warn("[TF] parseTextSelector bad selector: empty start");
-      return null;
-    }
-
-    const parsed = {
+    const decode = term => term == null ? null : this.decodeComponent(term);
+    return {
       raw,
-      prefix: prefixRaw != null ? this.decodeComponent(prefixRaw) : null,
-      start,
-      end: endRaw != null && endRaw !== "" ? this.decodeComponent(endRaw) : null,
-      suffix: suffixRaw != null ? this.decodeComponent(suffixRaw) : null,
+      prefix: decode(prefix),
+      start: decode(start),
+      end: decode(end),
+      suffix: decode(suffix),
     };
 
     return parsed;
+  }
+
+  #badSelector(raw) {
+    this.#log("warn", "parseTextSelector bad selector:", raw);
+    return null;
   }
 
   shouldSkipTextNode(node, doc, skipCache) {
@@ -205,67 +261,42 @@ export class TextFragmentResolver {
     return result;
   }
 
-
-  hasBlockBoundaryBetween(prevNode, node) {
-    // Walk up from prevNode until we find an ancestor that contains both nodes
-    let ancestor = prevNode.parentElement;
-    while (ancestor && !ancestor.contains(node)) {
-      if (this.isBlockElement(ancestor)) {
-        return true;
-      }
-      ancestor = ancestor.parentElement;
-    }
-
-    // Walk up from node until we find an ancestor that contains both nodes
-    ancestor = node.parentElement;
-    while (ancestor && !ancestor.contains(prevNode)) {
-      if (this.isBlockElement(ancestor)) {
-        return true;
-      }
-      ancestor = ancestor.parentElement;
-    }
-
-
-    // Walk document order between prevNode and node looking for block elements
-    // (catches text<br/>text case and other non-whitespace separated block siblings/cousins)
-    const commonAncestor = prevNode.parentElement?.contains(node)
-    ? prevNode.parentElement
-    : node.parentElement;
-    if (commonAncestor) {
-      const elWalker = prevNode.ownerDocument.createTreeWalker( commonAncestor, NodeFilter.SHOW_ELEMENT );
-      elWalker.currentNode = prevNode;
-      let el = elWalker.nextNode();
-      while (el && el !== node && !(el.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_PRECEDING)) {
-        if (this.isBlockElement(el)) return true;
-        el = elWalker.nextNode();
-      }
-    }
-
-    return false;
-  }
-
   buildNormalizedTextMap(doc) {
     const root = doc.documentElement;
-    //const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-    const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT);
 
     const entries = [];
     let normalized = "";
+    let text = "";
+    const normAt = [];
     let pendingSpace = false;
 
     let pendingBreak = false;
     const openBlocks = [];
     const blockBoundaries = new Set();
     const skipCache = new Map();
- 
-    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    let hiddenRoot = null;
+
+    for (const node of shadowIncludingDescendants(root)) {
+      if (node.nodeType !== Node.ELEMENT_NODE && node.nodeType !== Node.TEXT_NODE) continue;
+
+      // Skip everything inside an element with display: none. display isn't
+      // inherited, so the text's own parent can still look visible.
+      if (hiddenRoot) {
+        if (shadowIncludingContains(hiddenRoot, node)) continue;
+        hiddenRoot = null;
+      }
+
       // Blocks we have left since the previous node; capped at one separator.
-      while (openBlocks.length && !openBlocks[openBlocks.length - 1].contains(node)) {
+      while (openBlocks.length && !shadowIncludingContains(openBlocks[openBlocks.length - 1], node)) {
         openBlocks.pop();
         if (normalized.length > 0) pendingBreak = true;
       }
 
       if (node.nodeType === Node.ELEMENT_NODE) {
+        if (doc.defaultView?.getComputedStyle(node)?.display === "none") {
+          hiddenRoot = node;
+          continue;
+        }
         const tag = node.tagName?.toLowerCase();
         if (!INVISIBLE_TAGS.has(tag) && this.isBlockElement(node)) {
           openBlocks.push(node);
@@ -288,6 +319,8 @@ export class TextFragmentResolver {
         }
 
         if ((pendingBreak || pendingSpace) && normalized.length > 0) {
+          normAt.push(normalized.length);
+          text += " ";
           normalized += " ";
         }
 
@@ -298,7 +331,9 @@ export class TextFragmentResolver {
 
        const normStart = normalized.length;
        if (wasBreak && normStart > 0) blockBoundaries.add(normStart);
-       normalized += this.#caseFold( ch )
+        normAt.push(normStart);
+        text += ch;
+        normalized += this.#caseFold( ch )
 
         entries.push({
           normStart,
@@ -310,15 +345,18 @@ export class TextFragmentResolver {
       }
     }
 
+    // Segment the unfolded text. Folding strips marks, which changes how
+    // dictionary-based scripts like Thai are split into words.
+    normAt.push(normalized.length);
     const segmenter = new Intl.Segmenter([], { granularity: "word" });
     const wordBoundaries = new Set([0, normalized.length]);
-    for (const seg of segmenter.segment(normalized)) {
-      wordBoundaries.add(seg.index);
-      wordBoundaries.add(seg.index + seg.segment.length);
+    for (const seg of segmenter.segment(text)) {
+      wordBoundaries.add(normAt[seg.index]);
+      wordBoundaries.add(normAt[seg.index + seg.segment.length]);
     }
 
     /*
-    console.debug("[TF] buildNormalizedTextMap summary", {
+    console.debug("buildNormalizedTextMap summary", {
       normalizedLength: normalized.length,
       entryCount: entries.length,
       previewStart: normalized.slice(0, 200),
@@ -339,7 +377,7 @@ export class TextFragmentResolver {
   }
 
   invalidateCachesForDoc(doc) {
-    console.log("[TF] Clearing textMap and range caches");
+    this.#log("debug", "Clearing textMap and range caches");
       this.#normalizedTextMapByDoc.delete(doc);
       for (const [sectionIndex, cache] of this.#rangeCacheBySection) {
         for (const [locator, entry] of cache) {
@@ -361,21 +399,6 @@ export class TextFragmentResolver {
     this.#sectionBuildDoc.clear();
     this.#normalizedTextMapByDoc = new WeakMap();
     this.#rangeCacheBuildStarted = 0;
-  }
-
-  findAllIndices(haystack, needle, fromIndex = 0) {
-    const indices = [];
-    if (!needle) return indices;
-
-    let pos = fromIndex;
-    while (true) {
-      const found = haystack.indexOf(needle, pos);
-      if (found < 0) break;
-      indices.push(found);
-      pos = found + 1;
-    }
-
-    return indices;
   }
 
   #shouldRejectCrossBlockTerm(blockBoundaries, from, to) {
@@ -503,7 +526,9 @@ export class TextFragmentResolver {
 
   findStartPoint(entries, offset) {
     for (const entry of entries) {
-      if (entry.normStart === offset) {
+      // Skip the empty entry of a combining mark left over from the previous
+      // character.
+      if (entry.normStart === offset && entry.normEnd > offset) {
         return { node: entry.node, offset: entry.rawStart };
       }
       if (entry.normStart < offset && entry.normEnd > offset) {
@@ -515,8 +540,15 @@ export class TextFragmentResolver {
   }
 
   findEndPoint(entries, offset) {
-    for (const entry of entries) {
+    for (let i = 0; i < entries.length; i++) {
+      let entry = entries[i];
+
       if (entry.normEnd === offset) {
+        // Combining marks fold to nothing, so their entries are empty. Take in
+        // any that follow the last character.
+        while (i + 1 < entries.length && entries[i + 1].normStart === offset && entries[i + 1].normEnd === offset) {
+          entry = entries[++i];
+        }
         return { node: entry.node, offset: entry.rawEnd };
       }
       if (entry.normStart < offset && entry.normEnd >= offset) {
@@ -543,7 +575,7 @@ export class TextFragmentResolver {
 
   resolveTextFragmentRange(doc, sectionIndex, locator) {
     if (!doc) {
-      console.warn("[TF] No doc in resolveTextFragment");
+      this.#log("warn","No doc in resolveTextFragment");
       return null;
     }
 
@@ -556,28 +588,26 @@ export class TextFragmentResolver {
 
     const directives = this.splitTextDirectives(locator);
     if (!directives.length) {
-         console.warn("[TF] resolveTextFragmentRange no directives");
+         this.#log("debug","resolveTextFragmentRange no directives");
          return null;
     }
-    const directive = directives[0];
-
-    const selector = this.parseTextSelector(directive);
-    if (!selector) {
-      console.warn("[TF] Bad text fragment selector");
+    // Use the first directive that matches, as a browser does when scrolling.
+    const { normalized, entries, wordBoundaries, blockBoundaries } = this.#getNormalizedTextMap(doc);
+    let range = null;
+    for (const directive of directives) {
+      const selector = this.parseTextSelector(directive);
+      if (!selector) continue;
+      const match = this.findFirstMatch(normalized, blockBoundaries, wordBoundaries, selector);
+      if (match) {
+        range = this.makeRangeFromMatch(doc, entries, match);
+        if (range) break;
+      }
+    }
+    if (!range) {
+      this.#log("info",`No match found for text fragment locator: ${locator}`);
       return null;
     }
-
-    const { normalized, entries, wordBoundaries, blockBoundaries } = this.#getNormalizedTextMap(doc)    
-    const match = this.findFirstMatch(normalized, blockBoundaries, wordBoundaries, selector);
-    if (!match) {
-      console.warn( `[TF] No match found for text fragment locator: ${locator}`);
-      return null;
-    }
-    const range = this.makeRangeFromMatch(doc, entries, match);
-    if (range ) {
-      this.setCachedRange(doc, sectionIndex, locator, range);
-    }
-
+    this.setCachedRange(doc, sectionIndex, locator, range);
     return range;
   }
 
@@ -656,7 +686,7 @@ export class TextFragmentResolver {
 
     // Don't build on empty/placeholder documents
     if (!doc || doc.URL === "about:blank" || !doc.body?.hasChildNodes()) {
-      console.log(`[TF] Skipping cache build for section ${sectionIndex} - document not ready`);
+      this.#log("info",`Skipping cache build for section ${sectionIndex} - document not ready`);
       return;
     }
 
@@ -682,7 +712,7 @@ export class TextFragmentResolver {
     }
 
     this.#rangeCacheBuildStarted = performance.now()
-    console.log( `[TF] Starting range cache build for section: ${sectionIndex}` )
+    this.#log("debug", `Starting range cache build for section: ${sectionIndex}` )
 
    // this.#sectionBuildState.set(sectionIndex, { nextIndex: 0 });
     this.#sectionBuildState.set(sectionIndex, { nextIndex: 0, prevRange: null });
@@ -704,7 +734,7 @@ export class TextFragmentResolver {
 
     if (!Array.isArray(locators) || !state) {
       this.#sectionBuildTimers.delete(sectionIndex);
-      console.log( "[TF] locatorCacheChunk: no locators" );
+      this.#log("debug", "locatorCacheChunk: no locators" );
       return;
     }
 
@@ -727,7 +757,7 @@ export class TextFragmentResolver {
         if (range) {
           if (state.prevRange &&
               range.compareBoundaryPoints(Range.START_TO_START, state.prevRange) < 0) {
-            console.warn(`[TF] Out-of-order locator at index ${index}: ${locator}`);
+            this.#log("warn", `Out-of-order pre-cached locator at index ${index}: ${locator}`);
           }
           state.prevRange = range;
         }
@@ -735,7 +765,7 @@ export class TextFragmentResolver {
         index += 1
       }
     } catch (error) {
-      console.error(`[TF] Range cache build aborted for section ${sectionIndex} at index ${index}: ${locators[index]}`, error);
+      this.#log("error", `Range cache build aborted for section ${sectionIndex} at index ${index}: ${locators[index]}`, error);
       this.#sectionBuildState.delete(sectionIndex);
       this.#sectionBuildTimers.delete(sectionIndex);
       return;
@@ -747,7 +777,7 @@ export class TextFragmentResolver {
       this.#sectionBuildState.delete(sectionIndex);
       this.#sectionBuildTimers.delete(sectionIndex);
       const cacheBuildTime = performance.now() - this.#rangeCacheBuildStarted
-      console.log( `[TF] Finished range cache build for section ${sectionIndex}, ${locators.length} locators -- ${cacheBuildTime} ms` );
+      this.#log("debug", `Finished range cache build for section ${sectionIndex}, ${locators.length} locators -- ${cacheBuildTime} ms` );
       return;
     }
 
@@ -763,7 +793,6 @@ export class TextFragmentResolver {
   }
   getTextFragmentLocators(sectionIndex) {
     return this.#sectionLocators.get(sectionIndex) ?? [];
-
   }
 
   getSectionRangeCache(sectionIndex) {
